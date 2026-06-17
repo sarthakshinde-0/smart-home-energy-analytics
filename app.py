@@ -10,9 +10,10 @@ import time
 from datetime import datetime
 from sklearn.linear_model import LinearRegression, Ridge
 from sklearn.ensemble import RandomForestRegressor
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, GridSearchCV
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from xgboost import XGBRegressor
 import plotly.express as px
 import warnings
 warnings.filterwarnings('ignore')
@@ -161,7 +162,7 @@ with st.sidebar:
     st.write("- **Subject:** Python for Data Science")
     st.write("- **Team:** SY ECE A1")
     st.write("- **Dataset:** HomeC (Kaggle)")
-    st.write("- **Models:** LR, Ridge, RF")
+    st.write("- **Models:** LR, Ridge, RF, XGBoost")
     st.write("### 🔄 Auto-Refresh")
     auto_refresh = st.checkbox("Enable Auto-Refresh", value=False)
     refresh_interval = st.slider("Refresh Interval (seconds)", 5, 60, 30)
@@ -170,7 +171,7 @@ with st.sidebar:
         time.sleep(refresh_interval)
         st.rerun()
     st.markdown("---")
-    st.caption("v2.0 | 2026")
+    st.caption("v2.1 | 2026")
 
 # ═══════════════════════════════════════════════════════════════════════════
 # DATA LOADING
@@ -178,17 +179,21 @@ with st.sidebar:
 @st.cache_data
 def load_data():
     try:
-        df = pd.read_csv('HomeC_sample.csv')
+        df = pd.read_csv('HomeC_sample.csv', low_memory=False)
         df = df.rename(columns={'use_kW': 'use_kW', 'gen_kW': 'gen_kW', 'Temperature': 'temperature', 'Humidity': 'humidity'})
         if 'time' in df.columns:
-            df['time'] = pd.to_datetime(df['time'], errors='coerce')
+            # NOTE: HomeC timestamps are Unix seconds, not nanoseconds.
+            # pd.to_datetime defaults to nanoseconds, which silently mis-parses
+            # every row to the year 1970 and corrupts hour/month/dayofweek.
+            # unit='s' fixes this -> correct dates from 2016 onward.
+            df['time'] = pd.to_datetime(df['time'], unit='s', errors='coerce')
             df['hour'] = df['time'].dt.hour
             df['month'] = df['time'].dt.month
             df['dayofweek'] = df['time'].dt.dayofweek
         for col in ['use [kW]', 'gen [kW]', 'temperature', 'humidity']:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors='coerce')
-        df = df.dropna()
+        df = df.dropna(subset=['use [kW]', 'gen [kW]', 'temperature', 'humidity', 'time'])
         if 'use [kW]' in df.columns and 'gen [kW]' in df.columns:
             df['net_consumption'] = df['use [kW]'] - df['gen [kW]']
         return df
@@ -231,7 +236,7 @@ def show_home():
             <h4>🔋 Task 1: Smart Grid Load Balancing</h4>
             <p><strong>Type:</strong> Supervised Regression</p>
             <p><strong>Goal:</strong> Predict energy consumption based on environmental and usage factors</p>
-            <p><strong>Models:</strong> Linear Regression, Ridge, Random Forest</p>
+            <p><strong>Models:</strong> Linear Regression, Ridge, Random Forest, XGBoost</p>
             <p><strong>Metrics:</strong> R² Score, MAE, RMSE</p>
         </div>
         """, unsafe_allow_html=True)
@@ -408,13 +413,42 @@ def show_model_training():
     
     if target in df.columns and len(features) >= 2:
         model_choice = st.selectbox("Select Algorithm", 
-                                   ["Linear Regression", "Ridge Regression", "Random Forest"])
+                                   ["Linear Regression", "Ridge Regression", "Random Forest", "XGBoost"])
         
         # Model-specific parameters
+        use_gridsearch = False
         if model_choice == "Ridge Regression":
             alpha = st.slider("Regularization Strength (Alpha)", 0.01, 10.0, 1.0, 0.1)
         elif model_choice == "Random Forest":
             n_trees = st.slider("Number of Trees", 10, 200, 100, 10)
+        elif model_choice == "XGBoost":
+            tuning_mode = st.radio(
+                "How do you want to set hyperparameters?",
+                ["Manual sliders", "Auto-tune with GridSearchCV"],
+                horizontal=True
+            )
+            use_gridsearch = (tuning_mode == "Auto-tune with GridSearchCV")
+            if not use_gridsearch:
+                xgb_n_estimators = st.slider("Number of Trees (n_estimators)", 10, 300, 100, 10)
+                xgb_max_depth = st.slider("Max Tree Depth", 2, 10, 5, 1)
+                xgb_lr = st.select_slider("Learning Rate", options=[0.01, 0.05, 0.1, 0.2, 0.3], value=0.1)
+            else:
+                st.info(
+                    "🔍 **GridSearchCV** will try every combination of hyperparameters below using "
+                    "3-fold cross-validation and pick the combo with the best average R² score."
+                )
+                colg1, colg2, colg3 = st.columns(3)
+                with colg1:
+                    grid_n_estimators = st.multiselect("n_estimators options", [50, 100, 150, 200], default=[50, 100])
+                with colg2:
+                    grid_max_depth = st.multiselect("max_depth options", [3, 5, 7], default=[3, 5])
+                with colg3:
+                    grid_lr = st.multiselect("learning_rate options", [0.05, 0.1, 0.2], default=[0.05, 0.1])
+                
+                n_combos = max(len(grid_n_estimators), 1) * max(len(grid_max_depth), 1) * max(len(grid_lr), 1)
+                st.caption(f"⏱️ This will fit {n_combos} combinations × 3 folds = **{n_combos * 3} models**. "
+                           f"To keep this fast in a live demo, GridSearch trains on a random sample of the data "
+                           f"(max 50,000 rows) rather than the full dataset.")
         
         # Train button
         if st.button("🚀 Train Model"):
@@ -422,6 +456,9 @@ def show_model_training():
                 X = df[features]
                 y = df[target]
                 X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+                
+                best_params_found = None
+                cv_results_df = None
                 
                 if model_choice == "Linear Regression":
                     model = LinearRegression()
@@ -431,10 +468,49 @@ def show_model_training():
                     model = Ridge(alpha=alpha)
                     model.fit(X_train, y_train)
                     pred = model.predict(X_test)
-                else:
+                elif model_choice == "Random Forest":
                     model = RandomForestRegressor(n_estimators=n_trees, random_state=42)
                     model.fit(X_train, y_train)
                     pred = model.predict(X_test)
+                else:  # XGBoost
+                    if not use_gridsearch:
+                        model = XGBRegressor(
+                            n_estimators=xgb_n_estimators,
+                            max_depth=xgb_max_depth,
+                            learning_rate=xgb_lr,
+                            random_state=42
+                        )
+                        model.fit(X_train, y_train)
+                        pred = model.predict(X_test)
+                    else:
+                        # Cap rows fed into GridSearch so it stays demo-fast even on the full ~500K row dataset
+                        if len(X_train) > 50000:
+                            sample_idx = X_train.sample(n=50000, random_state=42).index
+                            X_grid, y_grid = X_train.loc[sample_idx], y_train.loc[sample_idx]
+                        else:
+                            X_grid, y_grid = X_train, y_train
+                        
+                        param_grid = {
+                            'n_estimators': grid_n_estimators if grid_n_estimators else [100],
+                            'max_depth': grid_max_depth if grid_max_depth else [5],
+                            'learning_rate': grid_lr if grid_lr else [0.1],
+                        }
+                        gs = GridSearchCV(
+                            XGBRegressor(random_state=42),
+                            param_grid,
+                            cv=3,
+                            scoring='r2',
+                            n_jobs=-1
+                        )
+                        gs.fit(X_grid, y_grid)
+                        model = gs.best_estimator_
+                        best_params_found = gs.best_params_
+                        cv_results_df = pd.DataFrame(gs.cv_results_)[
+                            ['params', 'mean_test_score', 'std_test_score', 'rank_test_score']
+                        ].sort_values('rank_test_score')
+                        # Refit best params on the FULL training set (not just the grid sample) for the final model
+                        model.fit(X_train, y_train)
+                        pred = model.predict(X_test)
                 
                 # Metrics
                 mae = mean_absolute_error(y_test, pred)
@@ -449,6 +525,18 @@ def show_model_training():
                 c2.metric("RMSE (Error)", f"{rmse:.4f}")
                 c3.metric("R² (Accuracy)", f"{r2:.4f}")
                 
+                # GridSearch-specific output
+                if best_params_found is not None:
+                    st.markdown("---")
+                    st.write("### 🔍 GridSearchCV Results")
+                    st.success(f"✅ **Best hyperparameters found:** {best_params_found}")
+                    st.write("Top combinations tried (ranked by cross-validation R²):")
+                    st.dataframe(cv_results_df.head(10), width='stretch')
+                    st.caption(
+                        "Note: search was run on a 50,000-row sample for speed; the winning hyperparameters "
+                        "were then refit on the full training set to produce the metrics above."
+                    )
+                
                 # Interpretation
                 st.markdown("---")
                 st.write("### 📊 Performance Interpretation")
@@ -460,8 +548,8 @@ def show_model_training():
                 else:
                     st.warning(f"⚠️ **Fair** R² = {r2:.4f} - consider adding more features")
                 
-                # Feature Importance (for RF)
-                if model_choice == "Random Forest":
+                # Feature Importance (for RF and XGBoost)
+                if model_choice in ("Random Forest", "XGBoost"):
                     st.markdown("---")
                     st.write("### 🎯 Feature Importance")
                     fi = pd.DataFrame({'Feature': features, 'Importance': model.feature_importances_})
@@ -561,7 +649,7 @@ def show_comparison():
     
     st.write("### 📊 Model Comparison")
     st.write("""
-    Compare all three models on the same test set to determine the best performer.
+    Compare all four models on the same test set to determine the best performer.
     All models trained with 80-20 train-test split.
     """)
     
@@ -592,6 +680,11 @@ def show_comparison():
         rf = RandomForestRegressor(n_estimators=50, random_state=42)
         rf.fit(X_train, y_train)
         results['RF'] = r2_score(y_test, rf.predict(X_test))
+        
+        # XGBoost (fixed reasonable defaults — fast, no tuning here; tuning lives on Model Training page)
+        xgb = XGBRegressor(n_estimators=100, max_depth=5, learning_rate=0.1, random_state=42)
+        xgb.fit(X_train, y_train)
+        results['XGBoost'] = r2_score(y_test, xgb.predict(X_test))
         
         # Results Table
         st.write("###  Performance Comparison")
@@ -626,8 +719,15 @@ def show_comparison():
                 st.write("Linear Regression works well when relationships are linear and features are not highly correlated.")
             elif best == 'Ridge':
                 st.write("Ridge Regression handles multicollinearity better through L2 regularization.")
-            else:
+            elif best == 'RF':
                 st.write("Random Forest captures non-linear relationships and handles complex patterns better.")
+            else:
+                st.write(
+                    "XGBoost builds trees sequentially, where each new tree corrects the errors of the "
+                    "previous ones (gradient boosting). This often lets it capture subtle non-linear patterns "
+                    "that a single Random Forest pass misses, especially once hyperparameters are tuned "
+                    "(see the Model Training page for GridSearchCV tuning)."
+                )
     else:
         st.error("Missing required columns")
 
